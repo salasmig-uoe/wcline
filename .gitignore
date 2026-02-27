@@ -1,0 +1,15 @@
+*.cache
+*.pyc
+*.pyo
+*.log
+*.vscode
+*~
+.idea
+.notes.swp
+/.env
+/.venv
+/local_config
+/collaborate/local_config
+/collaborate/.env
+/logs
+*.db
