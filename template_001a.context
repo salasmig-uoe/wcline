@@ -1,0 +1,224 @@
+# Talend .item → PySpark (SCD Type 2) Conversion Context
+
+Use this context when converting Talend .item XML jobs that implement **SCD Type 2** (e.g., tOracleSCD) into PySpark.
+
+## Goals
+- Preserve Talend data-flow semantics (component order, lookup behavior, join types).
+- Keep query/flow names aligned with Talend (e.g., `row1`, `row2`) for easy comparison.
+- Ensure output field order matches the Talend tMap output schema **exactly**.
+- Implement SCD Type 2 behavior end-to-end: **expire old rows in the target table (UPDATE/MERGE)**, insert new versions, and insert brand-new keys.
+
+---
+
+## Required Conventions
+### 1) Preserve Talend flow naming
+Use the Talend connection names for query variables/DataFrames:
+- `row1_sql`, `row1`, `row2_sql`, `row2`, etc.
+- This makes it easy to reconcile the PySpark script with the `.item` file.
+
+### Literal values must use lit()
+Whenever a literal is used in a column expression (including `coalesce`, `when`, comparisons, or assignments), wrap it in `lit()`.
+Examples:
+- `lit("")` for empty strings
+- `lit(None).cast("date")` for null dates
+- `lit("Y")` / `lit("N")` for flags
+
+### 2) Join types must match Talend tMap lookup settings
+In Talend tMap, each lookup table can be **innerJoin="true"** or optional.
+- If `innerJoin="true"` → use **inner join** in PySpark.
+- If not set (optional) → use **left join** in PySpark.
+
+Example:
+```python
+df = row1 \
+    .join(row2, on="<business_key>", how="inner")  # innerJoin=true in tMap
+    .join(row4, on="<business_key>", how="left")   # optional lookup
+```
+
+### 3) Keep output field order exactly as defined in Talend tMap metadata
+The tMap output schema is authoritative. Always order `.select(...)` columns to match it.
+This is critical for comparison and to avoid downstream schema mismatches.
+
+### 4) Rename lookup columns explicitly to avoid collisions
+When multiple lookups return the same column name, rename after each read:
+```python
+row4 = spark.read...load().withColumnRenamed("<source_column>", "<target_alias>")
+```
+This ensures each output field maps to the correct source.
+
+---
+
+## SCD Type 2 Implementation Guidance
+### Identify the keys and Type 2 fields
+From tOracleSCD:
+- `SOURCE_KEYS` → business key(s)
+- `L2_FIELDS` → fields that trigger new version creation (Type 2)
+- `L2_STARTDATE_FIELD`, `L2_ENDDATE_FIELD`, `L2_ACTIVE_FIELD`
+
+### Logic pattern
+#### Target ACTIVE_IND encoding (IMPORTANT)
+- The generated PySpark script must write `ACTIVE_IND` values to the **target** as **'1' (active) / '0' (inactive)**.
+- Do **not** “standardize” or remap `ACTIVE_IND` values in any *input/source* DataFrames (e.g., `row1`, lookups). Only apply the '1'/'0' encoding when writing to the **target**.
+
+#### Logic pattern
+1. **Load existing SCD table** and isolate active records (`ACTIVE_IND = '1'`).
+2. **New rows** = source keys not found in target.
+3. **Changed rows** = source keys found in active target but any L2 field differs.
+4. **Expire old rows** for changed keys:
+   - update `END_DATE = current_timestamp`
+   - set `ACTIVE_IND = '0'`
+5. **Insert new versions** for changed keys, and insert brand new keys:
+   - `START_DATE = current_timestamp`
+   - `END_DATE = null`
+   - `ACTIVE_IND = '1'`
+
+### Persistence requirement (UPDATE BACK RULE)
+It is not enough to compute a `to_expire` DataFrame. The conversion must **physically persist** expirations back to Oracle.
+
+Because Spark’s JDBC `DataFrameWriter` supports inserts but not row-level updates, the generated solution must include the **explicit update mechanism**:
+
+1) **Direct UPDATE using JDBC and prepared statements (acceptable for smaller volumes)**
+- Use a JDBC connection (Java gateway from Spark or a Python JDBC helper) and execute parameterized `UPDATE` statements per partition.
+- Must be idempotent: only update rows where `ACTIVE_IND='1'`.
+
+#### MERGE example (template)
+```sql
+MERGE INTO <schema>.<target_table> tgt
+USING <schema>.<staging_table> stg
+ON (
+  tgt.<key1> = stg.<key1>
+  AND tgt.<key2> = stg.<key2>
+  -- ... all SOURCE_KEYS
+  AND tgt.ACTIVE_IND = '1'
+)
+WHEN MATCHED THEN UPDATE SET
+  tgt.END_DATE = SYSTIMESTAMP,
+  tgt.ACTIVE_IND = '0';
+```
+
+### Ordering/atomicity
+- The generated script must **expire old rows first**, then **insert** the new versions.
+- If possible, perform the UPDATE/MERGE + INSERT in a single database transaction. If not possible, ensure the UPDATE step is executed and committed before inserts.
+
+### Field comparison
+Use `coalesce` to compare null-safe values for strings/dates:
+```python
+change_condition = (
+    (coalesce(col("src.<field_1>"), lit("")) != coalesce(col("tgt.<field_1>"), lit(""))) |
+    ...
+)
+```
+
+### Preferred strategy for many multi-column comparisons: hash-based comparison (IMPORTANT)
+Whenever the Talend job requires comparing **multiple columns** between two records/flows (e.g., change detection, equality checks, “did anything change?” logic), the generated code should **prefer** the same strategy used in `example.py`: build a deterministic “row signature” hash over the comparison columns and compare hashes instead of generating a long `OR` chain.
+
+**Why:**
+- Much shorter code (agent output is easier to read/review).
+- Less error-prone than hand-expanding `col != col` checks.
+- Centralizes null/default handling per column.
+
+**Required pattern:**
+1) Define a `compare_cols` spec list in **source order**, each element `(field_name, default_literal_expression)`.
+2) Implement a reusable function `hash_expr(prefix)` that:
+   - uses `coalesce(col(f"{prefix}.{field}"), default)`
+   - casts each element to string
+   - concatenates with a stable delimiter (e.g. `"||"`) via `concat_ws`
+   - hashes with `sha2(..., 256)`
+3) A row is considered changed when `src_hash != tgt_hash`.
+
+**Example (copy/adapt):**
+```python
+from pyspark.sql.functions import sha2, concat_ws
+
+# Fields to compare (null-safe defaults must be lit() and typed when needed)
+compare_cols = [
+    ("LVL1_CODE", lit("")),
+    ("LVL1_DESC", lit("")),
+    ("ACTIVE_FROM_DATE", lit("1970-01-01").cast("date")),
+]
+
+def hash_expr(prefix: str):
+    return sha2(
+        concat_ws(
+            "||",
+            *[
+                coalesce(col(f"{prefix}.{name}"), default).cast("string")
+                for name, default in compare_cols
+            ],
+        ),
+        256,
+    )
+
+src_hash = hash_expr("src")
+tgt_hash = hash_expr("tgt")
+
+changed_src = joined.filter(col("tgt.<first_key>").isNotNull() & (src_hash != tgt_hash)) \
+    .select("src.*") \
+    .dropDuplicates(keys)
+```
+
+**Rules:**
+- Do **not** use raw Python literals in expressions; defaults must be `lit(...)` (and cast for date/timestamp/numeric).
+- If there are only 1–2 fields, a direct `coalesce(...) != coalesce(...)` condition is acceptable, but hashing is still allowed.
+- Keep `compare_cols` in sync with the Talend metadata/intent for the comparison:
+  - `compare_cols` should correspond to the **exact set of fields Talend is comparing** for that step (SCD change detection, validation, delta detection between two flows, etc.).
+  - Never include business keys in `compare_cols` (keys belong in the join condition).
+  - Never include SCD system columns (`START_DATE`, `END_DATE`, `ACTIVE_IND`) in `compare_cols`.
+
+### Null-safe literal handling (IMPORTANT)
+When using `coalesce`, **never pass raw Python strings** like `''` or `'1970-01-01'`.
+Spark interprets raw strings as column names, which causes `UNRESOLVED_COLUMN`.
+
+✅ Always wrap literal defaults in `lit()`:
+- Strings: `lit("")`
+- Dates: `lit("1970-01-01").cast("date")`
+- Nulls: `lit(None).cast("date")` or appropriate type
+
+✅ Example:
+```python
+change_condition = (
+    (coalesce(col("src.SU_CODE"), lit("")) != coalesce(col("tgt.SU_CODE"), lit(""))) |
+    (coalesce(col("src.ACTIVE_FROM_DATE"), lit("1970-01-01").cast("date")) !=
+     coalesce(col("tgt.ACTIVE_FROM_DATE"), lit("1970-01-01").cast("date")))
+)
+```
+
+---
+
+## JDBC Usage
+Always read via `dbtable=f"({sql}) t"` to keep the SQL close to the Talend definition.
+Use the Oracle driver:
+```python
+jdbc_driver = "oracle.jdbc.OracleDriver"
+```
+
+---
+
+## Reusable helper patterns (apply anywhere in the conversion)
+### Multi-column comparison helper
+If the Talend job compares many fields (for any purpose), implement a small helper using the **hash-based comparison** pattern above:
+- define `compare_cols`
+- define `hash_expr(prefix)`
+- compare `hash_expr("left")` vs `hash_expr("right")`
+
+This is allowed and encouraged outside of SCD2 as well (e.g., validating lookup equality, detecting “delta” changes, comparing two flows before/after a tMap).
+
+---
+
+## Output Checklist
+When finishing a conversion, verify:
+- [ ] `rowN` naming preserved.
+- [ ] Join types match tMap innerJoin flags.
+- [ ] Output field order matches Talend tMap schema.
+- [ ] Each lookup column renamed to avoid collisions.
+- [ ] SCD logic updates old rows and inserts new versions.
+- [ ] All literal defaults in expressions use lit() (no raw strings).
+- [ ] Date literals are cast to date/timestamp when compared.
+
+### Enforcement
+Before final output, include a brief **Self-Review** section that explicitly confirms each Output Checklist item.
+If any item cannot be verified from available context, say so and ask for clarification.
+
+---
+
+End of context.
