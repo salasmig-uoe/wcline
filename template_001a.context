@@ -72,6 +72,61 @@ From tOracleSCD:
    - `END_DATE = null`
    - `ACTIVE_IND = '1'`
 
+### NULL handling for SCD keys (CRITICAL)
+Many EDW hierarchy-style SCDs use *composite keys* where deeper level key columns can legitimately be `NULL` (e.g., LVL6_ID is NULL for a level-5 node).
+
+**Spark joins treat `NULL != NULL`**, so a normal equi-join on key columns will fail to match those rows, which causes:
+- repeated “new” inserts on every run for those keys
+- failure to expire the previous active record for changed rows
+- behaviour that looks “random” but correlates with which key columns are NULL
+
+#### Required rule
+If any `SOURCE_KEYS` column can be NULL, the generated PySpark must use a **null-safe join** for key matching.
+
+✅ Use `eqNullSafe` on each key column and AND them together (preferred):
+```python
+from functools import reduce
+
+keys = ["<key1>", "<key2>", "<key3>"]
+
+def null_safe_join_condition(keys, left_alias="src", right_alias="tgt"):
+    return reduce(
+        lambda a, b: a & b,
+        [
+            col(f"{left_alias}.{k}").eqNullSafe(col(f"{right_alias}.{k}"))
+            for k in keys
+        ],
+    )
+
+join_cond = null_safe_join_condition(keys)
+joined = src.alias("src").join(tgt.alias("tgt"), on=join_cond, how="left")
+
+# Presence checks must use a non-null column that only exists on the RHS,
+# e.g. tgt.ACTIVE_IND, not a key column that might be NULL.
+new_src = joined.filter(col("tgt.ACTIVE_IND").isNull()).select("src.*")
+changed_src = joined.filter(col("tgt.ACTIVE_IND").isNotNull() & (src_hash != tgt_hash)).select("src.*")
+```
+
+🚫 Do NOT rely on `join(on=keys)` when keys may contain NULLs.
+
+#### Required rule for Oracle UPDATE/MERGE expiry
+When expiring rows in Oracle using `MERGE`/`UPDATE`, the match condition must also be NULL-safe.
+
+✅ Pattern:
+```sql
+ON (
+  (tgt.KEY1 = stg.KEY1 OR (tgt.KEY1 IS NULL AND stg.KEY1 IS NULL))
+  AND (tgt.KEY2 = stg.KEY2 OR (tgt.KEY2 IS NULL AND stg.KEY2 IS NULL))
+  -- ... all SOURCE_KEYS
+  AND tgt.ACTIVE_IND = '1'
+)
+```
+
+#### PreparedStatement binding rule (IMPORTANT)
+When executing the expiry MERGE/UPDATE with JDBC prepared statements:
+- bind NULL values using `pstmt.setNull(i, java.sql.Types.VARCHAR)` (or the correct SQL type)
+- do not call `setString(i, None)`
+
 ### Persistence requirement (UPDATE BACK RULE)
 It is not enough to compute a `to_expire` DataFrame. The conversion must **physically persist** expirations back to Oracle.
 
@@ -95,6 +150,8 @@ WHEN MATCHED THEN UPDATE SET
   tgt.END_DATE = SYSTIMESTAMP,
   tgt.ACTIVE_IND = '0';
 ```
+
+⚠️ If any SOURCE_KEYS can be NULL, replace the `tgt.key = stg.key` predicates above with the NULL-safe form described in **NULL handling for SCD keys (CRITICAL)**.
 
 ### Ordering/atomicity
 - The generated script must **expire old rows first**, then **insert** the new versions.
@@ -192,6 +249,45 @@ Use the Oracle driver:
 jdbc_driver = "oracle.jdbc.OracleDriver"
 ```
 
+---
+
+## Talend `tOracleOutput` table actions (IMPORTANT)
+
+Some Talend jobs clear target tables using `tOracleOutput` with `TABLE_ACTION=CLEAR`.
+
+### Required mapping for `TABLE_ACTION=CLEAR`
+When the Talend job specifies `TABLE_ACTION=CLEAR`, the generated PySpark notebook/script must:
+
+1) **Execute the clear operation inside Oracle via JDBC**, using Spark’s JVM gateway (`spark._sc._jvm`) and `java.sql.DriverManager`.
+   - Do **not** attempt to run `TRUNCATE`/`DELETE` via Spark SQL.
+   - This matches Talend’s behavior of executing the operation directly against the database.
+
+2) **Use `DELETE FROM <schema>.<table>` (not `TRUNCATE TABLE`)** for `CLEAR`.
+   - Rationale: `TRUNCATE` often requires stronger privileges (e.g., DROP on the table) and may succeed in Talend only due to different runtime grants/accounts.
+   - `DELETE FROM` is the safer/portable equivalent for “clear table” semantics.
+
+### If Talend uses explicit truncate
+If (and only if) the Talend component is configured with an explicit truncate action (e.g., `TABLE_ACTION=TRUNCATE`), then generate `TRUNCATE TABLE ...` **executed via JVM JDBC** (DriverManager) the same way.
+
+### Recommended code pattern (copy/adapt)
+```python
+    target_table = "TABLE_NAME"
+    target_fqn = f"{stg_schema}.{target_table}"
+
+    print(f"Clearing target table: {target_fqn}")
+    # NOTE: spark.sql("TRUNCATE TABLE ...") runs against Spark's catalog, not Oracle.
+    # We execute the clear directly on Oracle via JDBC.
+    # This environment/user may not have TRUNCATE privileges (ORA-01031), so we use DELETE.
+    jvm = spark._sc._jvm
+    jvm.java.lang.Class.forName(jdbc_driver)
+    conn = jvm.java.sql.DriverManager.getConnection(stg_url, stg_user, stg_pass)
+    try:
+        stmt = conn.createStatement()
+        stmt.execute(f"DELETE FROM {target_fqn}")
+        stmt.close()
+    finally:
+        conn.close()
+```
 ---
 
 ## Reusable helper patterns (apply anywhere in the conversion)
