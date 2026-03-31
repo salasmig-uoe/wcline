@@ -1,0 +1,97 @@
+
+### Database connections MUST use `uoe_spark_utils` (DICT-BASED) (IMPORTANT)
+For University of Edinburgh Spark jobs, **do not generate per-prefix scalar context variables** like:
+`stg_url`, `stg_user`, `stg_pass`, `stg_schema`, `apps_url`, etc.
+
+Instead, the generated notebook/script MUST:
+
+1) Import the shared helpers:
+```python
+from uoe_spark_utils import (
+    get_spark_session,
+    get_staging_db_config,
+    get_main_db_config,
+    get_apps_db_config,
+)
+```
+
+2) Create Spark + DB config dictionaries at the top of the script (immediately after imports):
+```python
+spark = get_spark_session()
+
+stg_db = get_staging_db_config()
+main_db = get_main_db_config()
+apps_db = get_apps_db_config()
+```
+
+3) Use the dictionaries in ALL JDBC reads/writes and any direct JDBC calls, for example:
+
+df = (
+    spark.read.format("jdbc").options(
+        url=stg_db["url"],
+        user=stg_db["user"],
+        password=stg_db["password"],
+        driver=jdbc_driver,
+        fetchsize=fetchsize,
+        dbtable=f"({some_sql}) t",
+    ).load()
+)
+Another example:
+(
+    df.write.format("jdbc").options(
+        url=stg_db["url"],
+        user=stg_db["user"],
+        password=stg_db["password"],
+        driver=jdbc_driver,
+        dbtable=f"{stg_db['schema']}.SOME_TABLE",
+        batchsize=batchsize,
+    ).mode("append").save()
+)
+
+# Direct JDBC (java.sql.DriverManager) example - when Talend uses TABLE_ACTION=CLEAR, etc.
+spark._sc._jvm.java.lang.Class.forName(jdbc_driver)
+props = spark._sc._jvm.java.util.Properties()
+props.setProperty("user", stg_db["user"])
+props.setProperty("password", stg_db["password"])
+conn = spark._sc._jvm.java.sql.DriverManager.getConnection(stg_db["url"], props)
+try:
+    stmt = conn.createStatement()
+    stmt.execute("DELETE FROM ...")
+    conn.commit()
+    stmt.close()
+finally:
+    conn.close()
+```
+
+4) Schema usage:
+- When building fully-qualified table names, ALWAYS use `..._db["schema"]`.
+- Example: `f"{apps_db['schema']}.ORG_ORGANISATION_UNITS"`.
+
+5) Traceability requirement (keep it, but adapt):
+- Keep the compact group header comment, but attach it to the dictionary assignment.
+- Example:
+```python
+# [XML LNN: 4-8] EDW_ORG_HIERARCHY_STG - EDW ORG hierarchy staging connection context
+stg_db = get_staging_db_config()
+```
+
+6) Secrets rule (still REQUIRED):
+- Never emit/copy passwords from Talend XML.
+- With this pattern, credentials are sourced from environment variables via `uoe_spark_utils`.
+- Do not create any `*_pass = ""` placeholders when using `uoe_spark_utils`.
+
+7) Additional params:
+- Do not generate `*_additional_params` variables.
+- If you must pass additional JDBC options, they should be handled inside `uoe_spark_utils` (not in generated notebooks).
+
+### Backward-compatibility note
+If you are converting older generated scripts that still use scalar variables (`stg_url`, `stg_user`, ...), replace them mechanically:
+- `stg_url` → `stg_db["url"]`
+- `stg_user` → `stg_db["user"]`
+- `stg_pass` → `stg_db["password"]`
+- `stg_schema` → `stg_db["schema"]`
+- `apps_url` → `apps_db["url"]`
+- `apps_user` → `apps_db["user"]`
+- `apps_pass` → `apps_db["password"]`
+- `apps_schema` → `apps_db["schema"]`
+
